@@ -1,0 +1,983 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Title: Sampling on the Migration Route: Genetic Structure and Population Assignment of Roseate Terns on the East Atlantic Flyway
+Date: 2025/10/15 
+
+R Environment, v.4.4.0
+
+Read in packages and scripts for analysis
+
+```{r, quiet=TRUE, results=FALSE, message=FALSE}
+
+#Read/Write and Manipulate data
+library('dplyr')
+library('stringr')
+library('readr')
+library('tidyr')
+library('gridExtra')
+library('reshape2')
+library('magrittr')
+#library('pbapply')
+
+#Visualization
+library("ggplot2")
+library("gridExtra")
+library('khroma')
+library('ggpubr')
+
+#Analysis
+library("adegenet")
+library("pegas")
+library("poppr")
+library("hierfstat")
+library('boot')
+
+#Running in parallel
+library('parallel')
+library("doParallel")
+library("foreach")
+
+source('genind2structure.R')
+bootstrap_mean_ci <- function(x, conf.level = 0.95, R = 2000) {
+  x <- x[!is.na(x)]
+  
+  mean_stat <- function(data, indices) mean(data[indices])
+  
+  boot_obj <- boot(x, statistic = mean_stat, R = R)
+  
+  ci <- boot.ci(boot_obj, conf = conf.level, type = "perc")
+  
+  m <- mean(x)
+  lower <- ci$percent[4]
+  upper <- ci$percent[5]
+  
+  sprintf("%.2f (%.2f-%.2f)", m, lower, upper)
+}
+
+```
+
+Read in data files and link lab_id with field_information
+
+```{r, quiet=TRUE, results=FALSE, message=FALSE}
+
+#lab_id for genotyped birds
+lab_id <- read_csv("data/lab_id_cdgenomics.csv") 
+
+#complete field information
+complete_info <- read_csv("data/field_info_v2.csv")
+
+#join field information with lab_id
+linked_in <- left_join(lab_id, complete_info, by='lab_id') %>%
+  dplyr::select(c(lab_id, 
+                  colony_inferred,
+                  year,
+                  location,
+                  country,
+                  hy_ad))
+
+#genotypes
+genind_msat = read.genalex("data/msat_cdgenomics_v2.csv", genclone = FALSE)
+
+```
+
+
+Determine how many birds were genotyped from different years & inferred colony-of-origin (see ms)
+
+```{r}
+#survey the grouping variables
+table(linked_in$country, linked_in$year)
+
+table(linked_in$colony_inferred, linked_in$year)
+
+#known age vs. unknown age
+table(linked_in$hy_ad, linked_in$colony_inferred)
+
+```
+
+Add population labels for different grouping arrangements 
+
+```{r}
+
+linked_in <- linked_in %>%
+  mutate(
+    CIxY = paste0(linked_in$colony_inferred, "_", linked_in$year),
+    CxY = paste0(linked_in$country, "_", linked_in$year),
+    LxY = paste0(linked_in$location, "_", linked_in$year)
+  )
+
+```
+
+
+Output divstats based on various grouping variables:
+
+Group samples by sampling location x Year: La Somone vs. La Barbarie
+
+```{r}
+all(indNames(genind_msat) == linked_in$lab_id) #naming is consistent
+pop(genind_msat) <- linked_in$LxY[match(indNames(genind_msat), linked_in$lab_id)]
+
+```
+
+Test for deviations from HWE
+
+```{r}
+# Chi-squared test: p-value
+HWE.test <- data.frame(sapply(seppop(genind_msat), 
+                              function(ls) pegas::hw.test(ls, B=1000)[,4])) # [,4] = Monte-Carlo P-values
+HWE.test.ext <- t(data.matrix(HWE.test))
+{cat("MC Exact P Values:", "\n")
+round(HWE.test.ext,5)}
+
+# Flatten to a vector
+pvals_all <- as.vector(HWE.test.ext)
+# Apply BY adjustment
+pvals_by <- p.adjust(pvals_all, method = "BY")
+# Reshape to original dimensions (same order)
+HWE.test.ext <- matrix(pvals_by, nrow = nrow(HWE.test.ext), ncol = ncol(HWE.test.ext),
+                          dimnames = dimnames(HWE.test.ext))
+{cat("MC Exact P Values:", "\n")
+round(HWE.test.ext,3)}
+
+#For each locus, what proportion of pops is each locus out of HWE?
+
+alpha=0.05
+sum(HWE.test.ext<0.05)/length(HWE.test.ext) #what % of tests yielded significant HWE deviation? 
+
+```
+
+Significant deviations from HWE were detected at Calbo1 [locus 11], so it was initially removed from subsequent analyses of genetic diversity & pairwise Fst. However, since exploratory analyses revealed that multiple sites contain private alleles at Calbo1, Fst values were unaffected by inclusion/exclusion of Calbo1, and since DAPC is robust to deviations from HWE, we used the full datast (including Calbo1) to assess all informative alleles retained.
+
+Genetic diversity based on 14 microsatellite loci across years & sampling sites in Senegal
+
+```{r}
+
+toRemove=which(locNames(genind_msat) == "Calbo1")
+genind_msat_14 <- genind_msat[loc=-toRemove]
+
+#Calculate diversity stats
+res.df = data.frame(n = summary(genind_msat$pop),
+                    population = popNames(genind_msat),
+                    p_a = private_alleles(genind_msat_14) %>% apply(1, sum),
+                    Ar = allelic.richness(genind2hierfstat(genind_msat_14))$Ar %>% apply(2, bootstrap_mean_ci),
+                    row.names = NULL) %>%
+  relocate(n, .after = population)
+
+#calculate basic divstats using hierfstat
+basic_msat = basic.stats(genind_msat_14, diploid = TRUE)
+
+res.df = res.df %>%
+  mutate(
+    Ho = basic_msat$Ho %>% apply(MARGIN = 2, FUN = mean, na.rm = TRUE) %>% round(2),
+    He = basic_msat$Hs %>% apply(MARGIN = 2, FUN = mean, na.rm = TRUE) %>% round(2),
+    F = basic_msat$Fis %>% apply(2, bootstrap_mean_ci)
+  )
+
+
+#Calculate F-stats in hierfstat
+
+#convert from genind to hierfstat
+hf_msat = genind2hierfstat(genind_msat_14,
+                           pop=pop(genind_msat_14))
+
+#pairwise Fst by W-C method
+Fst_msat = pairwise.WCfst(hf_msat) %>% round(digits = 2)
+
+#Bootstrap CIs for pairwise Fst
+fst_ci = boot.ppfst(dat=hf_msat,nboot=5000,quant=c(0.025, 0.975),diploid=TRUE)
+
+#Bootstrap CIs for population Fis
+fis_ci <- boot.ppfis(hf_msat, nboot=5000, quant=c(0.025, 0.975), diploid=TRUE)
+
+
+```
+
+Group samples based on inferred colony of origin (See ms for description) and calculate genetic diversity (14 microsatellite loci)
+
+```{r}
+
+#Change grouping label for popNames() 
+all(indNames(genind_msat) == linked_in$lab_id)
+pop(genind_msat) <- linked_in$colony_inferred[match(indNames(genind_msat), linked_in$lab_id)]
+
+# Create a factor with the desired order and sort individuals by this factor
+ordered_indices <- order(factor(pop(genind_msat),
+                                levels = c("NH","AZ","LIL",
+                                           "ROC","BR","COQ",
+                                           "unknown")))
+
+# Reorder individuals' genotypes in the Genind object
+reordered_genind <- genind_msat[ordered_indices, ]
+reordered_genind@tab <- genind_msat@tab[ordered_indices, ]
+
+# Verify the order
+pop(reordered_genind)
+
+genind_msat = reordered_genind
+
+genind_msat@pop <- factor(pop(genind_msat), 
+                          levels = unique(pop(genind_msat)))
+
+
+toRemove=which(locNames(genind_msat) == "Calbo1")
+genind_msat_14 <- genind_msat[loc=-toRemove]
+
+
+#Calculate diversity stats
+res.df = data.frame(n = summary(genind_msat$pop),
+                    population = popNames(genind_msat),
+                    p_a = private_alleles(genind_msat_14) %>% apply(1, sum),
+                    Ar = allelic.richness(genind2hierfstat(genind_msat_14),
+                                          min.n = 12)$Ar %>% apply(2, bootstrap_mean_ci),
+                    row.names = NULL) %>%
+  relocate(n, .after = population)
+
+#calculate basic divstats using hierfstat
+basic_msat = basic.stats(genind_msat_14, diploid = TRUE)
+
+res.df = res.df %>%
+  mutate(
+    Ho = basic_msat$Ho %>% apply(MARGIN = 2, FUN = mean, na.rm = TRUE) %>% round(2),
+    He = basic_msat$Hs %>% apply(MARGIN = 2, FUN = mean, na.rm = TRUE) %>% round(2),
+    F = basic_msat$Fis %>% apply(2, bootstrap_mean_ci)
+  )
+
+
+#Calculate F-stats in hierfstat
+
+#Convert genind to hierfstat object
+hf_msat = genind2hierfstat(genind_msat,pop=NULL)
+
+#Pairwise Fst by W-C method
+Fst_msat = pairwise.WCfst(hf_msat) %>% round(digits = 3)
+
+#Bootstrap CIs for pairwise Fst & Fis
+fst_ci = boot.ppfst(dat=hf_msat,nboot=5000,quant=c(0.025, 0.975), diploid=TRUE)
+fis_ci = boot.ppfis(dat=hf_msat,nboot=5000,quant=c(0.025, 0.975), diploid=TRUE)
+
+```
+
+Since sample sizes for some NWE colonies were small (e.g., FR) & no significant structure was identified in among NWE sites (i.e., LIL & ROC), these were grouped into "metapopulations" for subsequent analyses. 
+
+```{r}
+linked_in = linked_in %>%
+  mutate(colony_inferred = dplyr::recode(
+    colony_inferred,
+    ROC = "NWE", LIL = "NWE", COQ="NWE", BR="NWE", NH = "NWA"))
+
+table(linked_in$colony_inferred)
+
+#Change grouping label for popNames() 
+pop(genind_msat) <- linked_in$colony_inferred[match(indNames(genind_msat), linked_in$lab_id)]
+
+# Create a factor with the desired order and sort individuals by this factor
+ordered_indices <- order(factor(pop(genind_msat),
+                                levels = c("NWA", "AZ", "NWE", "unknown")))
+
+# Reorder individuals' genotypes in the Genind object
+reordered_genind <- genind_msat[ordered_indices, ]
+reordered_genind@tab <- genind_msat@tab[ordered_indices, ]
+
+# Verify the order
+pop(reordered_genind)
+
+genind_msat = reordered_genind
+
+```
+
+Test for deviations from HWE
+```{r}
+# Chi-squared test: p-value
+HWE.test <- data.frame(sapply(seppop(genind_msat), 
+                              function(ls) pegas::hw.test(ls, B=1000)[,4])) # [,4] = Monte-Carlo P-values
+HWE.test.ext <- t(data.matrix(HWE.test))
+{cat("MC Exact P Values:", "\n")
+round(HWE.test.ext,5)}
+
+# Flatten to a vector
+pvals_all <- as.vector(HWE.test.ext)
+# Apply BY adjustment
+pvals_by <- p.adjust(pvals_all, method = "BY")
+# Reshape to original dimensions (same order)
+HWE.test.ext <- matrix(pvals_by, nrow = nrow(HWE.test.ext), ncol = ncol(HWE.test.ext),
+                          dimnames = dimnames(HWE.test.ext))
+{cat("MC Exact P Values:", "\n")
+round(HWE.test.ext,3)}
+
+#What proportion of tests yielded significant deviation from HWE? 
+alpha=0.05
+sum(HWE.test.ext<0.05)/length(HWE.test.ext)
+
+```
+Genetic diversity based on 14 microsatellite loci across inferred metapopulation of origin:
+Northwest Atlantic (NWA), Azores (AZ), Northwest Europe (NWE), and unknown (unknown)
+
+```{r}
+toRemove=which(locNames(genind_msat) == "Calbo1")
+genind_msat_14 <- genind_msat[loc=-toRemove]
+
+#Calculate diversity stats
+res.df = data.frame(n = summary(genind_msat_14$pop),
+                    population = popNames(genind_msat_14),
+                    p_a = private_alleles(genind_msat_14) %>% apply(1, sum),
+                    Ar = allelic.richness(genind2hierfstat(genind_msat_14))$Ar %>% apply(2, bootstrap_mean_ci),
+                    row.names = NULL) %>%
+  relocate(n, .after = population)
+
+#calculate basic divstats using hierfstat
+basic_msat = basic.stats(genind_msat_14, diploid = TRUE)
+
+res.df = res.df %>%
+  mutate(
+    Ho = basic_msat$Ho %>% apply(MARGIN = 2, FUN = mean, na.rm = TRUE) %>% round(2),
+    He = basic_msat$Hs %>% apply(MARGIN = 2, FUN = mean, na.rm = TRUE) %>% round(2),
+    F = basic_msat$Fis %>% apply(2, bootstrap_mean_ci)
+  )
+
+
+#calculate fstats in hierfstat
+hf_msat = genind2hierfstat(genind_msat_14,pop=pop(genind_msat_14))
+
+#pairwise Fst by W-C method
+fst_msat = pairwise.WCfst(hf_msat) %>% round(digits = 3)
+
+#bootstrap CIs for pairwise Fst
+fst_ci = boot.ppfst(dat=hf_msat,nboot=5000,quant=c(0.025, 0.975),diploid=TRUE)
+fst_ci$ll = round(fst_ci$ll,2)
+fst_ci$ul = round(fst_ci$ul,2)
+fis_ci = boot.ppfis(dat=hf_msat,nboot=5000,quant=c(0.025, 0.975), diploid=TRUE)
+fis_ci$fis.ci = round(fis_ci$fis.ci,5)
+
+```
+
+Export genind object for STRUCTURE analysis & prepare for DAPC
+
+```{r}
+
+x = popsub(
+  genind_msat_14,
+  sublist = c("NWE", "AZ", "NWA"),
+  exclude = NULL,
+  blacklist = NULL,
+  mat = NULL,
+  drop = TRUE
+)
+
+table(pop(x))
+
+#Delete the first row with the name of the markers
+genind2structure(x, file="./data/msat_NWE_AZ_NWA.str", pops=TRUE)
+genind2structure(genind_msat_14, file="./data/msat_Unknown_NWE_AZ_NWA.str", pops=TRUE)
+
+```
+
+
+Perform DAPC on inferred-origin individuals with the full dataset to identify how well sites can be discriminated from each other by their genotypes (See MS)
+```{r}
+
+x = popsub(
+  genind_msat,
+  sublist = c("NWE", "AZ", "NWA"),
+  exclude = NULL,
+  blacklist = NULL,
+  mat = NULL,
+  drop = TRUE
+)
+
+x_scaled = scaleGen(x, NA.method="mean", center=TRUE, scale=TRUE)
+
+#n.pca = 15 was specified after initial run to evaluate optimal number of PCs 
+x_scaled.dapc= xvalDapc(x_scaled, pop(x), n.pca.max = 30, n.da=2, training.set = 0.70, n.pca = 15,
+                          result="groupMean", center = FALSE, scale = FALSE,
+                          n.rep=500, xval.plot = TRUE,
+                          parallel = "multicore", ncpus = 2)
+
+#Verify whether the data need a transformation to match the geographic arrangement of sampling sites
+scatter(x_scaled.dapc$DAPC)
+cat("Mean Successful Assignment by Number of PCs of PCA\n")
+print(x_scaled.dapc$`Mean Successful Assignment by Number of PCs of PCA`)
+cat("Root Mean Squared Error by Number of PCs of PCA\n")
+print(x_scaled.dapc[[5]])
+paste("PCs Retained:", x_scaled.dapc$DAPC$n.pca, "... DFs Retained:", x_scaled.dapc$DAPC$n.da)
+cat("Variance described by each of the retained PCs")
+print(round(100*x_scaled.dapc$DAPC$pca.eig[1:x_scaled.dapc$DAPC$n.pca]/sum(x_scaled.dapc$DAPC$pca.eig),digits=2))
+cat("Cumulative Variance of Retained PCs")
+round(100*x_scaled.dapc$DAPC$pca.eig[1:x_scaled.dapc$DAPC$n.pca]/sum(x_scaled.dapc$DAPC$pca.eig),digits=2) %>% sum()
+
+```
+
+Transform coordinates to match geographical arrangement and plot in ggplot2 framework
+
+```{r}
+#flip values across y-axis
+#x_scaled.dapc$DAPC$ind.coord[,2] <- x_scaled.dapc$DAPC$ind.coord[,2]*-1
+#flip values across x-axis
+#x_scaled.dapc$DAPC$ind.coord[,1] <- x_scaled.dapc$DAPC$ind.coord[,1]*-1
+
+
+x_scaled.dapc.df = as.data.frame(x_scaled.dapc$DAPC$ind.coord) %>%
+  mutate(
+    population = factor(pop(x), levels = c("NWA", "AZ", "NWE"))
+  )
+x_scaled.dapc.df$individual = rownames(x_scaled.dapc.df)
+
+
+colors.bright = c("NWA"="orange",
+                  "AZ"="darkorchid4", 
+                  "NWE"="deepskyblue")
+
+#DAPC Plot
+p_NWE_AZ_NWA = ggplot(x_scaled.dapc.df, aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 2, alpha = 0.5) + xlim(c(-6, 6)) + ylim(c(-6, 4)) +
+  stat_ellipse(level = 0.9, linewidth = 1) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 12, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.9,0.85)) +
+  ylab("LD-2") + xlab("LD-1")
+
+p_NWE_AZ_NWA
+
+#ggsave("dapc_known_origin.jpg", p_NWE_AZ_NWA, width=8, height=5, dpi=600)
+assignplot(x_scaled.dapc$DAPC)
+pred <- predict(x_scaled.dapc$DAPC)
+table(True = pop(x), Predicted = pred$assign)
+
+```
+
+Rebuild the DAPC model based on all "known-origin" individuals & leverage its loadings to predict the metapopulation origin of "unknown" birds sampled in Senegal (without resighting or banding data)
+
+```{r}
+# Prior to separating knowns & unknowns, scale the entire dataset (knowns+unknowns) together to removes bias from differences in scaling/centering:
+
+all_scaled = scaleGen(genind_msat, NA.method="mean", center=TRUE, scale = TRUE)
+known_scaled = all_scaled[which(pop(genind_msat) %in% c("NWA", "AZ", "NWE")),]
+unknown_scaled = all_scaled[which(pop(genind_msat) %in% c("unknown")),]
+
+# Verify that the # of rows (alleles) is consistent between each data set
+nrow(all_scaled) == sum(nrow(known_scaled), nrow(unknown_scaled)) 
+
+dapc_15 = dapc(known_scaled,
+               pop(genind_msat)[which(pop(genind_msat) %in% c("NWA", "AZ", "NWE"))] %>% droplevels(),
+               n.pca = 15, n.da=2, center = FALSE, scale = FALSE, var.contrib = TRUE)
+
+loadingplot(dapc_15$var.contr, axis=1, thresh=0.04, lab.jitter = 10)
+scatter(dapc_15)
+
+```
+
+Overlay DAPC-predicted unknowns onto previously generated model
+```{r}
+#Predict assignments for unknown_scaled based on prior dapc model loadings for known_scaled (dapc_15)
+pred.sup <- predict.dapc(dapc_15, newdata=unknown_scaled)
+
+#Posterior assignment probabilities of unknowns to each cluster
+sup.compo.df = round(pred.sup$posterior[1:(nrow(pred.sup$posterior)), 1:3],2) %>% as.data.frame()
+
+#Plot coordinates for each sample
+pred.sup.df = data.frame(individual = rownames(pred.sup$ind.scores),
+                         LD1 = pred.sup$ind.scores[,1],
+                         LD2 = pred.sup$ind.scores[,2],
+                         population = "Unknown")
+
+#Function finds the column names of values greater than 0.8 in a row, or "unknown" if none are found
+find_col_names_gt_0.80 <- function(row) {
+  col_indices <- which(row >= 0.80)
+  if (length(col_indices) == 0) {
+    "Unknown"
+  } else {
+    names(row)[col_indices]
+  }
+}
+
+col_names <- apply(sup.compo.df, 1, find_col_names_gt_0.80)
+
+# Modify "unknown" to inferred_population based on assignment probability (if P(assignment) > 0.9)
+all(pred.sup.df$individual == names(col_names))
+pred.sup.df$population = col_names
+table(pred.sup.df$population)
+
+
+#Flip data across x-axis (if needed) to match geographic arrangement
+#pred.sup.df$LD1 = pred.sup.df$LD1*-1
+
+dapc_15.df = data.frame(dapc_15$ind.coord,
+                        population = dapc_15$grp, 
+                        individual=rownames(dapc_15$ind.coord))
+
+#dapc_15.df$LD1 = dapc_15.df$LD1*-1
+
+dapc_15.df$population = factor(dapc_15.df$population,
+                               levels = c("NWA", "AZ", "NWE", "Unknown"))
+
+pred.sup.df$population = factor(pred.sup.df$population,
+                                levels = c("NWA", "AZ", "NWE", "Unknown"))
+
+
+#DAPC Plot
+p_NWE_AZ_NWA = ggplot(dapc_15.df,
+                      aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 1.5, alpha = 0.5) + xlim(c(-6, 6)) + ylim(c(-6, 4)) +
+  stat_ellipse(level = 0.9, linewidth = 0.5) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 14, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.15,0.2)) +
+  ylab("LD-2") + xlab("LD-1")
+
+p_NWE_AZ_NWA
+
+#use dapc_15
+p_pred = ggplot(dapc_15.df, aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 1.5, alpha = 0.15) +
+  stat_ellipse(level = 0.9, linewidth = 0.5) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue", "Unknown"="#b8bab9")) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue", "Unknown"="#b8bab9")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 14, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.15,0.2)) +
+  ylab("LD-2") + xlab("LD-1") +
+  geom_point(data = pred.sup.df,
+             aes(x = LD1,
+                 y = LD2), size = 2, alpha = 0.75) +
+  guides(fill = FALSE) + xlim(c(-6, 4)) + ylim(c(-6, 4))
+
+p_pred
+
+dapc_pred_combined = ggarrange(p_NWE_AZ_NWA, p_pred, ncol=2, labels = c("A", "B"),
+                               legend = "top", common.legend = TRUE, font.label = list(size = 16))
+
+ggsave("./plots/dapc_pred_combined.jpg", dapc_pred_combined, width=6, height=4, dpi=300, bg  = 'white',
+       units = 'in')
+
+
+```
+
+To account for the effects of uneven sampling of known-origin groups (i.e., NWE > 100) on the pop. assignment of unknowns, populations were subsampled prior to dapc() and predict.dapc(). To observe the stability of assignment rates across random subsamples, the following were iterated #s of times across subsamples. 
+
+Relevant functions
+```{r}
+
+run_one_iteration <- function(genind_msat, sample_sizes, n_pca, assign_probs) {
+
+  pops <- pop(genind_msat)
+  #n_pca = 30
+  #assign_probs = 0.8
+  
+  # Subsample each pop
+  nwe_sample <- sample_individuals("NWE", sample_sizes["NWE"], genind_msat, pops)
+  nwa_sample <- sample_individuals("NWA", sample_sizes["NWA"], genind_msat, pops)
+  az_sample  <- sample_individuals("AZ",  sample_sizes["AZ"],  genind_msat, pops)
+  unknown_sample <- sample_individuals("unknown", sample_sizes["unknown"], genind_msat, pops)
+  
+  combined_sample <- repool(nwe_sample, nwa_sample, az_sample, unknown_sample)
+  
+  # Scale entire dataset
+  all_scaled <- scaleGen(combined_sample, NA.method = "mean", center = TRUE, scale = TRUE)
+  
+  known_indices <- which(pop(combined_sample) %in% c("NWA", "AZ", "NWE"))
+  known_scaled <- all_scaled[known_indices, ]
+  known_pops <- pop(combined_sample)[known_indices] %>% droplevels()
+  
+  # DAPC cross-validation on knowns
+  xval <- xvalDapc(
+    known_scaled, known_pops,n.da = 2, training.set = 0.70,
+    result = "groupMean", center = FALSE, scale = FALSE,
+    n.pca = n_pca, n.rep = 100, xval.plot = FALSE,
+    parallel = "multicore", ncpus = 2
+  )
+  
+  mean_assign <- xval$`Mean Successful Assignment by Number of PCs of PCA`[[1]]
+  rmse <- xval[[5]][[1]]
+  
+  # Train final dapc model on all knowns
+  dapc_final <- dapc(
+    known_scaled, known_pops,
+    n.pca = n_pca, n.da = 2,
+    center = FALSE, scale = FALSE
+  )
+  
+  # Prepare unknown scaled data
+  unknown_indices <- which(pop(combined_sample) == "unknown")
+  unknown_scaled <- all_scaled[unknown_indices, ]
+  
+  # Predict populations of unknowns
+  pred <- predict.dapc(dapc_final, newdata = unknown_scaled)
+  posterior <- pred$posterior
+  
+  pred.df = data.frame(individual = rownames(pred$ind.scores),
+                           LD1 = pred$ind.scores[,1],
+                           LD2 = pred$ind.scores[,2],
+                           population = "Unknown")
+  
+  
+  # Assign population if posterior prob > 0.8 else "Unknown"
+  assign_pop <- apply(posterior, 1, function(probs) {
+    idx <- which(probs >= assign_probs)
+    if(length(idx) == 1) {
+      colnames(posterior)[idx]
+    } else {
+      "Unknown"
+    }
+  })
+  
+  pred.df$population = assign_pop
+  
+  # Count how many unknown individuals assigned to each pop
+  assign_counts <- table(factor(assign_pop, levels = c("NWA", "AZ", "NWE", "Unknown")))
+  
+  # Return results as list for easier downstream processing
+  list(
+    mean_assignment = mean_assign,
+    rmse = rmse,
+    unknown_assignment_counts = assign_counts,
+    dapc_final = dapc_final,
+    pred.df = pred.df
+  )
+  
+}
+
+sample_individuals <- function(pop_name, size, genind_obj, populations) {
+  indices <- which(populations == pop_name)
+  sampled_indices <- sample(indices, size = size, replace = FALSE)
+  genind_obj[sampled_indices, ]
+}
+
+# Summary stats for mean_assignment and rmse (same as before)
+summary_stats <- function(x) {
+  ci <- as.numeric(quantile(x, probs = c(0.025, 0.975)))
+  data.frame(
+    mean     = mean(x),
+    median   = median(x),
+    lower_95 = ci[1],
+    upper_95 = ci[2],
+    row.names = NULL
+  )
+}
+
+```
+
+Iterate DAPC across random subsamples & store results from each iteration. Output results from run. 
+
+```{r}
+# Set sample sizes for each pop
+sample_sizes <- c(NWE = 25, NWA = 25, AZ = 7, unknown = 128)
+
+# Run n iterations
+set.seed(123)
+n_iter <- 200
+results <- replicate(n_iter,
+                     run_one_iteration(genind_msat,
+                                       sample_sizes,
+                                       n_pca = 15,
+                                       assign_probs = 0.8),
+                     simplify = FALSE)
+
+
+#Extract mean_assignment and rmse into a dataframe
+results_df <- bind_rows(lapply(results, function(x) {
+  data.frame(mean_assignment = x$mean_assignment, rmse = x$rmse)
+}))
+
+#Extract unknown assignment counts into a matrix
+unknown_counts_mat <- do.call(rbind, lapply(results, function(x) {
+  as.integer(x$unknown_assignment_counts)
+}))
+colnames(unknown_counts_mat) <- c("NWA", "AZ", "NWE", "Unknown")
+
+cat("Summary of Mean Assignment Accuracy (across iterations):\n")
+print(summary_stats(results_df$mean_assignment))
+
+cat("\nSummary of RMSE (across iterations):\n")
+print(summary_stats(results_df$rmse))
+
+#Summary for unknown assignments across runs
+unknown_summary <- apply(unknown_counts_mat, 2, summary_stats)
+unknown_summary_df <- do.call(rbind, unknown_summary)
+rownames(unknown_summary_df) <- colnames(unknown_counts_mat)
+
+cat("\nSummary of Unknown Assignment Counts (mean number assigned per pop across iterations):\n")
+print(unknown_summary_df)
+
+
+```
+
+Generate a representative dataset of assigning unknowns (based on the subsampled model) to use for plotting
+
+```{r}
+
+example_output = run_one_iteration(genind_msat,
+                                       sample_sizes,
+                                       n_pca = 15,
+                                       assign_probs = 0.8)
+table(example_output$pred.df$population)
+table(example_output$dapc_final$grp)
+
+
+```
+
+Plot DAPC models
+Full: (A) Known vs. (B) Known+Unknown
+Subsampled: (C) Known vs. (D) Known+Unknown
+
+Full model:
+```{r}
+
+p_known_all = ggplot(dapc_15.df,
+                      aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 1.5, alpha = 0.5) + xlim(c(-6, 6)) + ylim(c(-6, 4)) +
+  stat_ellipse(level = 0.9, linewidth = 0.5) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 14, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.15,0.2)) +
+  ylab("LD-2") + xlab("LD-1")
+
+p_known_all
+
+#use x_scaled.dapc.df OR dapc_30
+p_pred_all = ggplot(dapc_15.df, aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 1.5, alpha = 0.15) + xlim(c(-6, 6)) + ylim(c(-6, 4)) +
+  stat_ellipse(level = 0.9, linewidth = 0.5) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue", "Unknown"="#b8bab9")) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue", "Unknown"="#b8bab9")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 14, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.15,0.2)) +
+  ylab("LD-2") + xlab("LD-1") +
+  geom_point(data = pred.sup.df,
+             aes(x = LD1,
+                 y = LD2), size = 1.5, alpha = 0.75) +
+  guides(fill = FALSE)
+
+p_pred_all
+
+```
+
+
+Subsampled Model
+```{r}
+
+#DAPC with subsampled dataset
+scatter(example_output$dapc_final)
+
+subsample_dapc_known = data.frame(example_output$dapc_final$ind.coord, 
+                        population = example_output$dapc_final$grp,
+                        individual=rownames(example_output$dapc_final$ind.coord))
+
+subsample_dapc_known$population = factor(subsample_dapc_known$population,
+                                         levels = c("NWA", "AZ", "NWE", "Unknown"))
+
+#Flip across y-axis and x-axis if needed to align with geographical arrangement
+subsample_dapc_known$LD1 = subsample_dapc_known$LD1*-1
+subsample_dapc_known$LD2 = subsample_dapc_known$LD2*-1
+
+p_known_subset = ggplot(subsample_dapc_known,
+                     aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 1.5, alpha = 0.5) + xlim(c(-6, 6)) + ylim(c(-6, 4)) +
+  stat_ellipse(level = 0.9, linewidth = 0.5) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 14, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.15,0.2)) +
+  ylab("LD-2") + xlab("LD-1")
+
+p_known_subset
+
+#dapc with predicted unknowns, based on subset
+
+example_output$pred.df$population = factor(example_output$pred.df$population,
+                                         levels = c("NWA", "AZ", "NWE", "Unknown"))
+
+example_output$pred.df$LD1 = example_output$pred.df$LD1*-1
+example_output$pred.df$LD2 = example_output$pred.df$LD2*-1
+
+p_pred_subset = ggplot(subsample_dapc_known,
+                       aes(x = LD1, y = LD2, color = population, fill = population)) +
+  geom_point(size = 1.5, alpha = 0.15) + xlim(c(-6, 6)) + ylim(c(-6, 4)) +
+  stat_ellipse(level = 0.9, linewidth = 0.5) +
+  scale_fill_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  scale_color_manual(values = c("NWA"="orange","AZ"="darkorchid4","NWE"="deepskyblue")) +
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  theme_bw() + 
+  theme(text = element_text(size = 14, family = "sans"),
+        legend.title=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line= element_line(colour = "black"),
+        legend.position = c(0.15,0.2)) +
+  ylab("LD-2") + xlab("LD-1") +
+  geom_point(data = example_output$pred.df,
+             aes(x = LD1,
+                 y = LD2), size = 1.5, alpha = 0.75)
+
+```
+
+
+Build Figure 3
+```{r, fig.width=7, fig.height=8 }
+
+dapc_all_combined = ggarrange(p_known_all, p_pred_all, 
+                               p_known_subset, p_pred_subset,
+                               ncol=2, nrow=2, labels = c("A", "B", "C", "D"),
+                               legend = "top", common.legend = TRUE, font.label = list(size = 16))
+dapc_all_combined
+
+
+
+
+```
+
+```{r, fig.width=7, fig.height=8}
+# Define top and left labels
+top_labels <- ggarrange(
+  text_grob("Known", face = "bold", size = 16, vjust = 0.5, hjust = -0.1),
+  text_grob("Known + Unknown", face = "bold", size = 16, vjust = 0.5, hjust = 0.3),
+  ncol = 2,
+  widths = c(1, 1)
+)
+
+left_labels <- ggarrange(
+  text_grob("Full", rot = 90, face = "bold", size = 16, vjust = 0.5, hjust = 0.7),
+  text_grob("Subset", rot = 90, face = "bold", size = 16, vjust = 0.5, hjust = 0.3),
+  ncol = 1,
+  heights = c(1, 1)
+)
+
+# Main plot grid
+plots_grid <- ggarrange(
+  p_known_all, p_pred_all,
+  p_known_subset, p_pred_subset,
+  ncol = 2, nrow = 2,
+  labels = c("A", "B", "C", "D"),
+  legend = "top", common.legend = TRUE, font.label = list(size = 16)
+)
+
+# Combine everything with balanced spacing
+dapc_all_combined <- ggarrange(
+  ggarrange(NULL, top_labels, ncol = 1, heights = c(0.02, 1)),
+  ggarrange(left_labels, plots_grid, ncol = 2, widths = c(0.04, 1)),
+  ncol = 1,
+  heights = c(0.08, 1)  # adjust top margin to control vertical centering
+)
+
+dapc_all_combined
+
+ggsave("./plots/dapc_all_combined.jpg", dapc_all_combined, width=7, height=8, dpi=500, bg  = 'white',
+       units = 'in')
+```
+
+
+Update original genind_msat with representative example from subsampled dataset;
+adjust for assignments based on full- vs. subset- model
+
+Assignments based on subset model
+```{r}
+
+#pull out names of AZ-predicted origin birds from this example_output
+pred_azores_birds = example_output$pred.df$individual[example_output$pred.df$population == "AZ"]
+pred_nwe_birds = example_output$pred.df$individual[example_output$pred.df$population == "NWE"]
+pred_nwa_birds = example_output$pred.df$individual[example_output$pred.df$population == "NWA"] #character(0)
+
+genind_msat@pop[which(rownames(genind_msat@tab) %in% pred_azores_birds)] = "AZ"
+genind_msat@pop[which(rownames(genind_msat@tab) %in% pred_nwe_birds)] = "NWE"
+
+
+linked_in$colony_inferred[which(linked_in$lab_id %in% pred_azores_birds)] = 'AZ'
+linked_in$colony_inferred[which(linked_in$lab_id %in% pred_nwe_birds)] = 'NWE'
+
+table(linked_in$colony_inferred, linked_in$year)
+
+```
+
+Visualize "informativeness" of loci in panel based on Global Fst & DAPC loadings
+
+```{r, fig.width= 4.5, fig.height=3}
+
+hf_x = genind2hierfstat(x, pop=NULL)
+x_fst = wc(hf_x)
+x_fst$per.loc[order(x_fst$per.loc[, 1], decreasing = TRUE),]
+
+#Rank loci by global Fst
+locus_fst = x_fst$per.loc[order(x_fst$per.loc[, 1], decreasing = TRUE),1, drop=FALSE]
+
+loci <- gsub("\\..*", "", rownames(dapc_15$var.contr))  # Extract locus names
+locus_contributions <- tapply(rowSums(dapc_15$var.contr), loci, sum)
+
+locus_loadings = data.frame(DAPC = locus_contributions,
+                            row.names = names(locus_contributions))
+
+#Rank loci by loadings
+locus_loadings = locus_loadings[order(locus_loadings$DAPC, decreasing = TRUE), 1, drop=FALSE]
+loci_informativeness = cbind(locus_fst, locus_loadings)
+
+
+
+p_loci = ggplot(loci_informativeness, aes(x = FST, y = DAPC, label = rownames(temp))) +
+  geom_point(color = "black", size = 1.5, alpha = 0.5) +  # Scatter plot of points
+  ggrepel::geom_text_repel(size = 2.5, color = "black") +  # Labels for each point
+  labs(x = expression(Global~F[ST]), y = "Allele Contributions (DAPC)") +
+  scale_y_continuous(breaks = seq(0, 0.25, by = 0.05), limits = c(0,0.25)) +
+  theme_minimal() +  # Clean theme
+  theme(plot.title = element_text(hjust = 0.5),
+       text = element_text(size = 14, family = 'sans'),
+       panel.border = element_blank(),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       axis.line= element_line(colour = "black"))  # Center the title
+
+p_loci
+ggsave("./plots/loci_informativeness.jpg", p_loci, width=4.5, height=3, units = 'in', dpi=500, bg = 'white')
+
+
+```
