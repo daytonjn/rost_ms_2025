@@ -4,5 +4,4 @@
 
 **Date:** 2025/10
 - Data files provided in "data" folder
-- Scripts for analyses provided in "scripts" folder
-- Plots from output provided in "plots"
+- Output plots provided in "plots"
